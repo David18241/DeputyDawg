@@ -1,0 +1,4 @@
+.envrc
+.clasp.json
+venv/
+.direnv/ 
