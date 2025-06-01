@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="DeputyDawg Logo" width="200"/>
+</p>
+
 # Deputy Timesheet Sync to Google Sheets
 
 This project automates the process of fetching approved timesheets from the Deputy API and writing them to a specified Google Sheet. It is designed to run as a Google Apps Script project, with optional local development and deployment using clasp.
