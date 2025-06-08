@@ -1,68 +1,27 @@
 // Code.gs - Main script file
 
 // --- SCRIPT PROPERTIES (to be set in File > Project properties > Script properties) ---
-// DEPUTY_INSTALL: your_install_name
-// DEPUTY_GEO: your_geo_code (e.g., na, au, eu)
-// DEPUTY_ACCESS_TOKEN: your_deputy_api_token
-// DEPUTY_AUTH_TYPE: 'Bearer' or 'DeputyKey'
-// SPREADSHEET_ID: id_of_your_google_sheet
-// SHEET_NAME: name_of_the_tab (e.g., 'Time Card Data')
-// TIMESHEET_ID_COLUMN_INDEX: 0 (if "DeputyTimesheetID" is in Col A for deduplication)
-// ADMIN_EMAIL_FOR_NOTIFICATIONS: your_admin_email@example.com (for error alerts)
+// DEPUTY_INSTALL, DEPUTY_GEO, DEPUTY_ACCESS_TOKEN, DEPUTY_AUTH_TYPE
+// SPREADSHEET_ID, SHEET_NAME, TIMESHEET_ID_COLUMN_INDEX
+// ADMIN_EMAIL_FOR_NOTIFICATIONS
 
-function mainDataFetchAndProcess() {
-  const scriptProperties = PropertiesService.getScriptProperties();
-  const installName = scriptProperties.getProperty('DEPUTY_INSTALL');
-  const geo = scriptProperties.getProperty('DEPUTY_GEO');
-  const accessToken = scriptProperties.getProperty('DEPUTY_ACCESS_TOKEN');
-  const authType = scriptProperties.getProperty('DEPUTY_AUTH_TYPE') || 'Bearer';
-
-  const SPREADSHEET_ID = scriptProperties.getProperty('SPREADSHEET_ID');
-  const SHEET_NAME = scriptProperties.getProperty('SHEET_NAME');
-  let TIMESHEET_ID_COLUMN_INDEX = parseInt(scriptProperties.getProperty('TIMESHEET_ID_COLUMN_INDEX'), 10);
-  if (isNaN(TIMESHEET_ID_COLUMN_INDEX)) {
-    Logger.log("TIMESHEET_ID_COLUMN_INDEX Script Property is not a valid number, defaulting to 0.");
-    TIMESHEET_ID_COLUMN_INDEX = 0;
-  }
-  const ADMIN_EMAIL = scriptProperties.getProperty('ADMIN_EMAIL_FOR_NOTIFICATIONS');
-
-
-  if (!installName || !geo || !accessToken || !SPREADSHEET_ID || !SHEET_NAME || !ADMIN_EMAIL) {
-    const errorMessage = "ERROR: One or more required Script Properties are not set (DEPUTY_*, SPREADSHEET_*, ADMIN_EMAIL_*).";
-    Logger.log(errorMessage);
-    if (ADMIN_EMAIL) MailApp.sendEmail(ADMIN_EMAIL, "Deputy Sync Configuration Error", errorMessage);
-    else Logger.log("Admin email not configured to send error notification.");
-    return;
-  }
-
-  const deputyApiBaseUrl = `https://${installName}.${geo}.deputy.com/api/v1`;
-
-  // --- 1. Fetch all Leave Rules first ---
-  const leaveRuleMap = fetchAllLeaveRules(accessToken, authType, deputyApiBaseUrl);
-  if (Object.keys(leaveRuleMap).length === 0) {
-    Logger.log("Warning: No leave rules were fetched or mapped. Leave types might be incorrect.");
-    // Decide if this is a critical error, for now, we'll proceed.
-  }
-
-  // --- 2. Fetch Timesheets ---
-  const { startDate, endDate } = getPreviousPayPeriodDates();
-  Logger.log(`Querying Deputy Timesheets for dates: ${startDate} to ${endDate}`);
-
-  let allApiTimesheets = [];
+/**
+ * Reusable helper function to fetch timesheets with a specific filter. Handles pagination.
+ * @param {Object} searchFilter - The 'search' object for the Deputy API query.
+ * @param {Object} config - An object containing API configuration.
+ * @param {Array<string>} joinArray - The array of objects to join.
+ * @return {Array} An array of timesheet objects.
+ */
+function fetchDeputyTimesheets(searchFilter, config, joinArray) {
+  let allResults = [];
   let currentStartRecord = 0;
-  const MAX_RECORDS_PER_CALL = 500;
   let keepFetching = true;
-
-  const timesheetQueryEndpoint = `${deputyApiBaseUrl}/resource/Timesheet/QUERY`;
+  const MAX_RECORDS_PER_CALL = 500;
 
   while (keepFetching) {
     const queryPayload = {
-      "search": {
-        "s1": { "field": "Date", "type": "ge", "data": startDate },
-        "s2": { "field": "Date", "type": "le", "data": endDate },
-        "s3": { "field": "TimeApprover", "type": "gt", "data": 0 }
-      },
-      "join": ["EmployeeObject"],
+      "search": searchFilter,
+      "join": joinArray,
       "sort": { "Date": "asc", "StartTimeLocalized": "asc" },
       "max": MAX_RECORDS_PER_CALL,
       "start": currentStartRecord
@@ -70,201 +29,290 @@ function mainDataFetchAndProcess() {
 
     const options = {
       'method': 'POST',
-      'headers': { 'Authorization': `${authType} ${accessToken}` },
+      'headers': { 'Authorization': `${config.authType} ${config.accessToken}` },
       'payload': JSON.stringify(queryPayload),
       'contentType': 'application/json',
       'muteHttpExceptions': true
     };
 
-    Logger.log(`Fetching timesheets from Deputy. Start record: ${currentStartRecord}, Max: ${MAX_RECORDS_PER_CALL}`);
+    Logger.log(`Fetching timesheets with filter: ${JSON.stringify(searchFilter)}. Start: ${currentStartRecord}`);
     try {
-      const response = UrlFetchApp.fetch(timesheetQueryEndpoint, options);
+      const response = UrlFetchApp.fetch(config.endpoint, options);
       const responseCode = response.getResponseCode();
       const responseBody = response.getContentText();
 
       if (responseCode === 200) {
         const jsonData = JSON.parse(responseBody);
         if (Array.isArray(jsonData)) {
-          Logger.log(`Fetched ${jsonData.length} timesheet records in this call.`);
-          allApiTimesheets = allApiTimesheets.concat(jsonData);
+          allResults = allResults.concat(jsonData);
           if (jsonData.length < MAX_RECORDS_PER_CALL) {
             keepFetching = false;
-            Logger.log("Last page of timesheet data reached.");
           } else {
             currentStartRecord += jsonData.length;
           }
         } else {
-          Logger.log(`Timesheet API Response 200, but not an array. Body: ${responseBody}. Stopping.`);
-          keepFetching = false; break;
+          Logger.log(`API Response 200, but not an array. Stopping.`);
+          keepFetching = false;
         }
       } else {
-        Logger.log(`Deputy Timesheet API Error: ${responseCode}. Response: ${responseBody}. Stopping.`);
-        MailApp.sendEmail(ADMIN_EMAIL, "Deputy Sync API Error (Timesheets)", `Failed to fetch timesheets. Code: ${responseCode}. Body: ${responseBody}`);
-        keepFetching = false; break;
+        const apiErrorMsg = `Deputy API Error: ${responseCode}. Filter: ${JSON.stringify(searchFilter)}. Response: ${responseBody}`;
+        Logger.log(apiErrorMsg);
+        if(config.adminEmail) MailApp.sendEmail(config.adminEmail, "Deputy Sync API Error", apiErrorMsg);
+        return [];
       }
     } catch (e) {
-      Logger.log(`Exception during Deputy Timesheet API call: ${e.toString()}. Stack: ${e.stack}. Stopping.`);
-      MailApp.sendEmail(ADMIN_EMAIL, "Deputy Sync Script Error (Timesheets)", `Exception: ${e.toString()}\nStack: ${e.stack}`);
-      keepFetching = false; break;
+      const scriptErrorMsg = `Exception during API call: ${e.toString()}`;
+      Logger.log(scriptErrorMsg);
+      if(config.adminEmail) MailApp.sendEmail(config.adminEmail, "Deputy Sync Script Error", scriptErrorMsg);
+      return [];
     }
-    // Utilities.sleep(200); // Optional delay
   }
+  return allResults;
+}
 
-  Logger.log(`Total approved timesheets fetched from Deputy API: ${allApiTimesheets.length}`);
-  if (allApiTimesheets.length === 0 && !keepFetching) { // Check !keepFetching to ensure it wasn't an error stop
-    Logger.log("No approved timesheets found for the specified period, or an error occurred before fetching any.");
+/**
+ * Main function to fetch and process data.
+ */
+function mainDataFetchAndProcess() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const config = {
+    installName: scriptProperties.getProperty('DEPUTY_INSTALL'),
+    geo: scriptProperties.getProperty('DEPUTY_GEO'),
+    accessToken: scriptProperties.getProperty('DEPUTY_ACCESS_TOKEN'),
+    authType: scriptProperties.getProperty('DEPUTY_AUTH_TYPE') || 'Bearer',
+    spreadsheetId: scriptProperties.getProperty('SPREADSHEET_ID'),
+    sheetName: scriptProperties.getProperty('SHEET_NAME'),
+    timesheetIdColumnIndex: parseInt(scriptProperties.getProperty('TIMESHEET_ID_COLUMN_INDEX'), 10) || 0,
+    adminEmail: scriptProperties.getProperty('ADMIN_EMAIL_FOR_NOTIFICATIONS')
+  };
+
+  if (!config.installName || !config.accessToken || !config.spreadsheetId || !config.adminEmail) {
+    const errorMessage = "ERROR: One or more required Script Properties are not set.";
+    Logger.log(errorMessage);
+    if (config.adminEmail) MailApp.sendEmail(config.adminEmail, "Deputy Sync Configuration Error", errorMessage);
+    return;
+  }
+  config.endpoint = `https://${config.installName}.${config.geo}.deputy.com/api/v1/resource/Timesheet/QUERY`;
+
+  const { startDate, endDate } = getPreviousPayPeriodDates();
+  Logger.log(`Querying Deputy Timesheets for dates: ${startDate} to ${endDate}`);
+
+  const joinArray = ["EmployeeObject", "Leave", "LeaveRuleObject"];
+
+  // --- Fetch Timesheets in Two Separate, Simple Batches ---
+  
+  // Filter 1: Manually approved shifts
+  const manualApprovalFilter = {
+    "s1": { "field": "Date", "type": "ge", "data": startDate },
+    "s2": { "field": "Date", "type": "le", "data": endDate },
+    "s3": { "field": "TimeApprover", "type": "gt", "data": 0 }
+  };
+  const manualApprovedTimesheets = fetchDeputyTimesheets(manualApprovalFilter, config, joinArray);
+  
+  // Filter 2: System-approved leave shifts
+  const leaveApprovalFilter = {
+    "s1": { "field": "Date", "type": "ge", "data": startDate },
+    "s2": { "field": "Date", "type": "le", "data": endDate },
+    "s3": { "field": "TimeApprover", "type": "eq", "data": -2 }
+  };
+  const leaveTimesheets = fetchDeputyTimesheets(leaveApprovalFilter, config, joinArray);
+
+  // Combine and deduplicate results using a Map
+  const allTimesheetsMap = new Map();
+  manualApprovedTimesheets.forEach(ts => allTimesheetsMap.set(ts.Id, ts));
+  leaveTimesheets.forEach(ts => allTimesheetsMap.set(ts.Id, ts));
+  const allApiTimesheets = Array.from(allTimesheetsMap.values());
+  
+  Logger.log(`Total unique approved timesheets fetched: ${allApiTimesheets.length} (${manualApprovedTimesheets.length} manual, ${leaveTimesheets.length} leave)`);
+  if (allApiTimesheets.length === 0) {
+    Logger.log("No approved timesheets found for the specified period.");
     return;
   }
 
-
-  // --- 3. Process and Write to Sheet ---
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(SHEET_NAME);
+  // --- FINAL ADDITION: Sort the combined array by Timesheet ID in descending order ---
+  Logger.log("Sorting all timesheets by ID in ascending order before processing.");
+  allApiTimesheets.sort((a, b) => a.Id - b.Id);
+  
+  // --- Process and Write to Sheet ---
+  const ss = SpreadsheetApp.openById(config.spreadsheetId);
+  const sheet = ss.getSheetByName(config.sheetName);
   if (!sheet) {
-    const sheetErrorMsg = `ERROR: Sheet "${SHEET_NAME}" not found in Spreadsheet ID "${SPREADSHEET_ID}".`;
+    const sheetErrorMsg = `ERROR: Sheet "${config.sheetName}" not found.`;
     Logger.log(sheetErrorMsg);
-    MailApp.sendEmail(ADMIN_EMAIL, "Deputy Sync Error - Sheet Not Found", sheetErrorMsg);
+    MailApp.sendEmail(config.adminEmail, "Deputy Sync Error - Sheet Not Found", sheetErrorMsg);
     return;
   }
 
-  const existingTimesheetIDsInSheet = getExistingDeputyIDsFromSheet(sheet, TIMESHEET_ID_COLUMN_INDEX);
-  Logger.log(`Found ${existingTimesheetIDsInSheet.size} existing Timesheet IDs in the sheet for deduplication.`);
+  const existingTimesheetIDsInSheet = getExistingDeputyIDsFromSheet(sheet, config.timesheetIdColumnIndex);
+  Logger.log(`Found ${existingTimesheetIDsInSheet.size} existing Timesheet IDs for deduplication.`);
 
   const rowsToAppend = [];
-  // Updated headers to match your simplified sheet
-  const sheetHeaders = [
-      "TimeSheet ID", "Employee Export Code", "Employee Name", "Date", "Start", "End", "Mealbreak",
-      "Total Hours", "Total Cost", "Employee Comment", "Area Name", "Location Name", "Leave", "Manager's Comment"
-  ];
-  // Note: Your sample CSV has "TimeSheet ID" (with space) for the first column. My code uses "DeputyTimesheetID".
-  // I'll use your CSV's "TimeSheet ID" here for consistency.
+  const sheetHeaders = [ "TimeSheet ID", "Employee Id", "Employee Name", "Date", "Start", "End", "Mealbreak", "Total Hours", "Total Cost", "Employee Comment", "Area Name", "Location Name", "Leave", "Manager's Comment" ];
   checkAndWriteHeaderRow(sheet, sheetHeaders);
 
   for (const ts of allApiTimesheets) {
-    const deputyTimesheetIdString = ts.Id.toString();
-    if (existingTimesheetIDsInSheet.has(deputyTimesheetIdString)) {
-      Logger.log(`Skipping duplicate Timesheet ID: ${deputyTimesheetIdString}`);
+    if (existingTimesheetIDsInSheet.has(ts.Id.toString())) {
+      Logger.log(`Skipping duplicate Timesheet ID: ${ts.Id}`);
       continue;
     }
 
-    let leaveTypeName = "";
-    if (ts.IsLeave && ts.LeaveRule) {
-      leaveTypeName = lookupLeaveRuleName(ts.LeaveRule, leaveRuleMap);
-    } else if (ts.IsLeave) {
-      leaveTypeName = "Leave (Rule ID Missing)";
-    }
-    
+    let rowData;
     const employeeObject = ts.EmployeeObject || {};
-    const dpMetaData = ts._DPMetaData || {};
-    const operationalUnitInfo = dpMetaData.OperationalUnitInfo || {};
+    const operationalUnitInfo = (ts._DPMetaData && ts._DPMetaData.OperationalUnitInfo) ? ts._DPMetaData.OperationalUnitInfo : {};
 
-    const rowData = [
-      deputyTimesheetIdString,               // TimeSheet ID (from Deputy ts.Id)
-      // --- CORRECTED MAPPING FOR EMPLOYEE EXPORT CODE ---
-      employeeObject.Id ? employeeObject.Id.toString() : '', // Employee Export Code (from EmployeeObject.Id)
-      employeeObject.DisplayName || '',      // Employee Name
-      formatApiDateToSheetDate(ts.Date),     // Date
-      formatApiTimeToSheetTime(ts.StartTimeLocalized), // Start
-      formatApiTimeToSheetTime(ts.EndTimeLocalized),   // End
-      formatDurationFromSeconds(calculateMealbreakDurationInSeconds(ts.Slots)), // Mealbreak
-      ts.TotalTime || 0,                     // Total Hours
-      ts.Cost || 0,                          // Total Cost
-      ts.EmployeeComment || '',              // Employee Comment
-      operationalUnitInfo.OperationalUnitName || '', // Area Name
-      operationalUnitInfo.CompanyName || '', // Location Name
-      leaveTypeName,                         // Leave
-      ts.SupervisorComment || ''             // Manager's Comment
-    ];
+    if (ts.IsLeave) {
+      Logger.log(`Processing Leave Timesheet ID: ${ts.Id}`);
+      
+      const leaveTypeName = (ts.LeaveRuleObject && ts.LeaveRuleObject.Name) 
+          ? ts.LeaveRuleObject.Name 
+          : "Leave (Rule Name Missing)";
+
+      let startTime = '', endTime = '', totalHours = 0, leaveComment = '';
+      
+      if (ts.Leave && ts.Leave.LeavePayLineArray) {
+        const payLine = ts.Leave.LeavePayLineArray.find(line => line.TimesheetId === ts.Id);
+        if (payLine) {
+          startTime = formatApiTimeToSheetTime(payLine.StartTimeLocalized);
+          endTime = formatApiTimeToSheetTime(payLine.EndTimeLocalized);
+          totalHours = parseFloat(payLine.Hours) || 0;
+        }
+      }
+      
+      if (!startTime && ts.Leave) { startTime = formatApiTimeToSheetTime(ts.Leave.StartTimeLocalized); }
+      if (!endTime && ts.Leave) { endTime = formatApiTimeToSheetTime(ts.Leave.EndTimeLocalized); }
+      if (totalHours === 0) { totalHours = (ts.Leave && ts.Leave.TotalHours) ? ts.Leave.TotalHours : ts.TotalTime || 0; }
+      leaveComment = ts.Leave ? (ts.Leave.Comment || '') : ts.EmployeeComment || '';
+      
+      rowData = [ ts.Id.toString(), employeeObject.Id ? employeeObject.Id.toString() : '', employeeObject.DisplayName || '', formatApiDateToSheetDate(ts.Date), startTime, endTime, "0:00:00", totalHours, ts.Cost || 0, leaveComment, '', operationalUnitInfo.CompanyName || '', leaveTypeName, ts.SupervisorComment || ''];
+
+    } else { // Regular work timesheet
+      Logger.log(`Processing Regular Timesheet ID: ${ts.Id}`);
+      rowData = [ ts.Id.toString(), employeeObject.Id ? employeeObject.Id.toString() : '', employeeObject.DisplayName || '', formatApiDateToSheetDate(ts.Date), formatApiTimeToSheetTime(ts.StartTimeLocalized), formatApiTimeToSheetTime(ts.EndTimeLocalized), formatDurationFromSeconds(calculateMealbreakDurationInSeconds(ts.Slots)), ts.TotalTime || 0, ts.Cost || 0, ts.EmployeeComment || '', operationalUnitInfo.OperationalUnitName || '', operationalUnitInfo.CompanyName || '', '', ts.SupervisorComment || ''];
+    }
     rowsToAppend.push(rowData);
   }
 
   if (rowsToAppend.length > 0) {
     try {
-      sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, sheetHeaders.length)
-           .setValues(rowsToAppend);
-      Logger.log(`Successfully appended ${rowsToAppend.length} new timesheet entries to the sheet.`);
+      sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, sheetHeaders.length).setValues(rowsToAppend);
+      Logger.log(`Successfully appended ${rowsToAppend.length} new timesheet entries.`);
     } catch (e) {
-        const sheetWriteErrorMsg = `Error writing to Google Sheet: ${e.toString()}. Stack: ${e.stack}`;
-        Logger.log(sheetWriteErrorMsg);
-        MailApp.sendEmail(ADMIN_EMAIL, "Deputy Sync Error - Sheet Write Failure", sheetWriteErrorMsg);
+      const sheetWriteErrorMsg = `Error writing to Google Sheet: ${e.toString()}`;
+      Logger.log(sheetWriteErrorMsg);
+      MailApp.sendEmail(config.adminEmail, "Deputy Sync Error - Sheet Write Failure", sheetWriteErrorMsg);
     }
   } else {
-    Logger.log("No new timesheet entries to append (all were duplicates or no data fetched after filtering).");
+    Logger.log("No new timesheet entries to append.");
   }
 }
 
+/**
+ * Wrapper function for the bi-weekly trigger. Checks if it's the correct week to run.
+ */
 function mainDataFetchAndProcess_biWeeklyCheck() {
-    const scriptProperties = PropertiesService.getScriptProperties();
-    const ADMIN_EMAIL = scriptProperties.getProperty('ADMIN_EMAIL_FOR_NOTIFICATIONS');
+  const firstRunYear = 2025, firstRunMonth = 5, firstRunDay = 4; // Wed, June 4th, 2025
+  const firstScheduledRunDateUTC = new Date(Date.UTC(firstRunYear, firstRunMonth, firstRunDay));
+  const now = new Date();
+  const currentRunDateUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const diffInDays = Math.floor((currentRunDateUTC - firstScheduledRunDateUTC) / (1000 * 60 * 60 * 24));
 
-    // --- Define the very first "active" run date and time (EST) ---
-    // We'll use UTC for calculations to avoid timezone issues in date math,
-    // then convert the trigger's current time to a comparable format.
-    const firstRunYear = 2025; // As per the example: June 4th, 2025
-    const firstRunMonth = 5;   // 0-indexed for JavaScript Date (0=Jan, 5=June)
-    const firstRunDay = 4;
-    // No specific need for the hour here for the "is it the right week" check,
-    // as the trigger handles the 4 AM run.
-
-    // Create a UTC date for the first scheduled run day (ignoring time of day for this check)
-    const firstScheduledRunDateUTC = new Date(Date.UTC(firstRunYear, firstRunMonth, firstRunDay));
-
-    // Get current date in UTC (ignoring time of day for this check)
-    const now = new Date();
-    const currentRunDateUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-
-    // Calculate the difference in days
-    const millisecondsPerDay = 24 * 60 * 60 * 1000;
-    const diffInTime = currentRunDateUTC.getTime() - firstScheduledRunDateUTC.getTime();
-    const diffInDays = Math.floor(diffInTime / millisecondsPerDay);
-
-    Logger.log(`Bi-weekly check: First scheduled run (UTC date): ${firstScheduledRunDateUTC.toUTCString()}`);
-    Logger.log(`Bi-weekly check: Current run (UTC date): ${currentRunDateUTC.toUTCString()}`);
-    Logger.log(`Bi-weekly check: Difference in days from first scheduled run: ${diffInDays}`);
-
-    // Check if the current run date is on or after the first scheduled run
-    // And if the number of days difference is a multiple of 14 (for bi-weekly)
-    if (diffInDays >= 0 && diffInDays % 14 === 0) {
-        Logger.log("This is an active Wednesday for the bi-weekly schedule. Proceeding with data fetch.");
-        try {
-            mainDataFetchAndProcess();
-            // No need to store last run timestamp for *this specific* bi-weekly logic,
-            // as it's based on a fixed schedule.
-            Logger.log("mainDataFetchAndProcess completed successfully for scheduled bi-weekly run.");
-        } catch (e) {
-            const errorMessage = `Error during scheduled mainDataFetchAndProcess execution: ${e.toString()}. Stack: ${e.stack}`;
-            Logger.log(errorMessage);
-            if (ADMIN_EMAIL) {
-                MailApp.sendEmail(ADMIN_EMAIL, "Deputy Sync CRITICAL ERROR", errorMessage);
-            }
-        }
-    } else {
-        Logger.log("Skipping mainDataFetchAndProcess: Not a scheduled bi-weekly run date.");
-        if (diffInDays < 0) {
-            Logger.log("Reason: Current date is before the first scheduled run date.");
-        } else {
-            Logger.log(`Reason: Day difference (${diffInDays}) is not a multiple of 14 from the first run date.`);
-        }
-    }
+  Logger.log(`Bi-weekly check: First run date: ${firstScheduledRunDateUTC.toUTCString()}. Days since: ${diffInDays}.`);
+  if (diffInDays >= 0 && diffInDays % 14 === 0) {
+    Logger.log("This is an active Wednesday. Proceeding with data fetch.");
+    mainDataFetchAndProcess();
+  } else {
+    Logger.log("Skipping run: Not a scheduled bi-weekly run date.");
+  }
 }
 
-function setupTrigger() { // Renamed from setupBiWeeklyTrigger for clarity
-  // Deletes all existing triggers for this script to avoid duplicates if re-run.
-  // Be cautious if you have other triggers for other functions in this project.
-  const existingTriggers = ScriptApp.getProjectTriggers();
-  for (let i = 0; i < existingTriggers.length; i++) {
-    if (existingTriggers[i].getHandlerFunction() === "mainDataFetchAndProcess_biWeeklyCheck") {
-        ScriptApp.deleteTrigger(existingTriggers[i]);
-        Logger.log("Deleted existing trigger for mainDataFetchAndProcess_biWeeklyCheck.");
+/**
+ * Sets up the time-driven trigger. Run this function MANUALLY ONCE.
+ */
+function setupTrigger() {
+  const functionName = "mainDataFetchAndProcess_biWeeklyCheck";
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === functionName) {
+      ScriptApp.deleteTrigger(trigger);
+      Logger.log(`Deleted existing trigger for ${functionName}.`);
     }
-  }
-
-  // Create a new trigger
-  ScriptApp.newTrigger('mainDataFetchAndProcess_biWeeklyCheck')
+  });
+  ScriptApp.newTrigger(functionName)
       .timeBased()
       .onWeekDay(ScriptApp.WeekDay.WEDNESDAY)
-      .atHour(4) // 4 AM
-      .inTimezone("America/New_York") // Explicitly set EST/EDT
+      .atHour(4)
+      .inTimezone("America/New_York")
       .create();
-  Logger.log("New trigger created for 'mainDataFetchAndProcess_biWeeklyCheck' to run every Wednesday at 4 AM EST/EDT.");
+  Logger.log(`New trigger created for ${functionName} to run every Wednesday at 4 AM EST/EDT.`);
+}
+
+// Code.gs
+
+// ... (all your other working functions go here) ...
+
+
+// --- TEMPORARY DEBUGGING FUNCTION TO FIND MANAGER'S COMMENT ---
+/**
+ * Fetches all timesheets for a specific date (May 20, 2025) to inspect all
+ * potential comment fields returned by the API.
+ */
+function debugManagerComments() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const config = {
+    installName: scriptProperties.getProperty('DEPUTY_INSTALL'),
+    geo: scriptProperties.getProperty('DEPUTY_GEO'),
+    accessToken: scriptProperties.getProperty('DEPUTY_ACCESS_TOKEN'),
+    authType: scriptProperties.getProperty('DEPUTY_AUTH_TYPE') || 'Bearer',
+  };
+  config.endpoint = `https://${config.installName}.${config.geo}.deputy.com/api/v1/resource/Timesheet/QUERY`;
+
+  // --- We will look at a specific date you know has manager comments ---
+  const targetDate = "2025-05-20"; 
+  
+  Logger.log(`DEBUG: Fetching ALL timesheets for date: ${targetDate} to find manager comments.`);
+
+  // We are NOT filtering by approval status, to see everything.
+  const queryPayload = {
+    "search": {
+      "s1": { "field": "Date", "type": "eq", "data": targetDate }
+    },
+    "join": ["EmployeeObject", "Leave", "LeaveRuleObject"]
+  };
+
+  const options = {
+    'method': 'POST',
+    'headers': { 'Authorization': `${config.authType} ${config.accessToken}` },
+    'payload': JSON.stringify(queryPayload),
+    'contentType': 'application/json',
+    'muteHttpExceptions': true
+  };
+
+  const response = UrlFetchApp.fetch(config.endpoint, options);
+  const responseBody = response.getContentText();
+  Logger.log(`DEBUG: API Response Code: ${response.getResponseCode()}`);
+  
+  if (response.getResponseCode() === 200) {
+    const jsonData = JSON.parse(responseBody);
+    if (jsonData && jsonData.length > 0) {
+      Logger.log(`---------- DEBUGGING COMMENTS FOR ${jsonData.length} TIMESHEETS ON ${targetDate} ----------`);
+      
+      jsonData.forEach((ts, index) => {
+        const employeeName = ts.EmployeeObject ? ts.EmployeeObject.DisplayName : 'N/A';
+        Logger.log(`--- Record #${index + 1} | Timesheet ID: ${ts.Id} | Employee: ${employeeName} ---`);
+        Logger.log(`SupervisorComment (our current mapping): ${ts.SupervisorComment}`);
+        Logger.log(`EmployeeComment (the other comment field): ${ts.EmployeeComment}`);
+        // For leave, comments can be in other places too
+        if (ts.IsLeave && ts.Leave) {
+          Logger.log(`Leave Comment: ${ts.Leave.Comment}`);
+          Logger.log(`Leave ApprovalComment: ${ts.Leave.ApprovalComment}`);
+        }
+        Logger.log(`Full Timesheet Object: ${JSON.stringify(ts)}`); // Log the whole object as a final check
+        Logger.log(`-----------------------------------------------------`);
+      });
+
+    } else {
+      Logger.log("DEBUG: No timesheets found for this date.");
+    }
+  } else {
+    Logger.log(`DEBUG: API Error: ${responseBody}`);
+  }
 }
